@@ -52,9 +52,12 @@ const sanitizeForPrompt = (input: string): string => {
 }
 
 /**
- * Pre-processes an image file to improve clarity and reduce noise before analysis.
- * Applies a pipeline of filters using an HTML canvas: grayscale, brightness/contrast adjustment, 
- * and sharpening to enhance edges. This helps the AI model better recognize text and structure on the bill.
+ * Pre-processes an image file to improve clarity for OCR and AI analysis.
+ * This function applies a multi-stage enhancement pipeline using an HTML canvas:
+ * 1. Grayscale Conversion: Simplifies the image to luminance values.
+ * 2. Noise Reduction: A Gaussian blur is applied to smooth out high-frequency noise.
+ * 3. Contrast Enhancement: Increases the difference between light and dark areas to make text stand out.
+ * 4. Sharpening: A convolution filter enhances the edges of characters to improve their definition.
  */
 const processImage = (file: File): Promise<File> => {
   return new Promise((resolve, reject) => {
@@ -72,75 +75,99 @@ const processImage = (file: File): Promise<File> => {
       canvas.width = img.width;
       canvas.height = img.height;
       
-      // 1. Draw original image
+      // Draw original image
       ctx.drawImage(img, 0, 0);
 
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const data = imageData.data;
-
-      // 2. Apply Grayscale, Brightness, and Contrast in a single pass for efficiency.
-      const brightness = 10;  // Slightly increase brightness for clarity in shadows.
-      const contrast = 50;    // Increase contrast to make text stand out.
-      const factor = (259 * (contrast + 255)) / (255 * (259 - contrast));
-
+      // --- STAGE 1: Grayscale Conversion ---
+      // Simplifies the image to intensity values, a prerequisite for many processing steps.
+      let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      let data = imageData.data;
       for (let i = 0; i < data.length; i += 4) {
-        // Grayscale using the luminosity method for more perceptually accurate results.
         const gray = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
-        
-        // Apply brightness and contrast to the grayscale value.
-        let color = gray + brightness;
-        color = factor * (color - 128) + 128;
-        
-        // Clamp the value to the valid 0-255 range.
-        const clampedColor = Math.max(0, Math.min(255, color));
-
-        data[i] = clampedColor;
-        data[i + 1] = clampedColor;
-        data[i + 2] = clampedColor;
+        data[i] = data[i + 1] = data[i + 2] = gray;
       }
       ctx.putImageData(imageData, 0, 0);
 
-      // 3. Apply a Sharpening Filter (Convolution) to enhance edges.
-      // This helps the model distinguish characters and lines more easily.
-      const weights = [0, -1, 0, -1, 5, -1, 0, -1, 0]; // A standard sharpening kernel.
-      const side = 3;
-      const halfSide = 1;
+      // --- STAGE 2: Noise Reduction (Gaussian Blur) ---
+      // A subtle blur removes high-frequency noise (e.g., salt-and-pepper noise)
+      // before sharpening, preventing the noise from being amplified.
+      const blurKernel = [1, 2, 1, 2, 4, 2, 1, 2, 1];
+      const blurDivisor = 16;
+      let srcData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      let dstData = ctx.createImageData(canvas.width, canvas.height);
+      let src = srcData.data;
+      let dst = dstData.data;
+      let side = 3;
+      let halfSide = 1;
 
-      const srcData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const dstData = ctx.createImageData(canvas.width, canvas.height);
-      const src = srcData.data;
-      const dst = dstData.data;
-      
-      // Iterate over the entire image, handling edges by clamping coordinates.
       for (let y = 0; y < canvas.height; y++) {
         for (let x = 0; x < canvas.width; x++) {
           const dstOff = (y * canvas.width + x) * 4;
           let r = 0, g = 0, b = 0;
-
           for (let cy = 0; cy < side; cy++) {
             for (let cx = 0; cx < side; cx++) {
-              // Clamp coordinates to stay within image bounds
               const scy = Math.min(canvas.height - 1, Math.max(0, y + cy - halfSide));
               const scx = Math.min(canvas.width - 1, Math.max(0, x + cx - halfSide));
-              
               const srcOff = (scy * canvas.width + scx) * 4;
-              const wt = weights[cy * side + cx];
+              const wt = blurKernel[cy * side + cx];
               r += src[srcOff] * wt;
               g += src[srcOff + 1] * wt;
               b += src[srcOff + 2] * wt;
             }
           }
-
-          // Clamp the final pixel values
-          dst[dstOff] = Math.max(0, Math.min(255, r));
-          dst[dstOff + 1] = Math.max(0, Math.min(255, g));
-          dst[dstOff + 2] = Math.max(0, Math.min(255, b));
-          dst[dstOff + 3] = src[dstOff + 3]; // Preserve alpha channel
+          dst[dstOff] = r / blurDivisor;
+          dst[dstOff + 1] = g / blurDivisor;
+          dst[dstOff + 2] = b / blurDivisor;
+          dst[dstOff + 3] = src[dstOff + 3];
         }
       }
       ctx.putImageData(dstData, 0, 0);
 
-      // 4. Convert canvas back to a high-quality JPEG file.
+      // --- STAGE 3: Contrast Enhancement ---
+      // Increases the visual separation between dark (text) and light (background) areas.
+      imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      data = imageData.data;
+      const contrast = 64; // A value between 0-128 is reasonable.
+      const factor = (259 * (contrast + 255)) / (255 * (259 - contrast));
+      for (let i = 0; i < data.length; i += 4) {
+        const color = data[i]; // Image is already grayscale
+        const newColor = factor * (color - 128) + 128;
+        data[i] = data[i + 1] = data[i + 2] = Math.max(0, Math.min(255, newColor));
+      }
+      ctx.putImageData(imageData, 0, 0);
+      
+      // --- STAGE 4: Sharpening ---
+      // A convolution filter enhances the edges of text, making characters more distinct.
+      const sharpenKernel = [0, -1, 0, -1, 5, -1, 0, -1, 0];
+      srcData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      dstData = ctx.createImageData(canvas.width, canvas.height);
+      src = srcData.data;
+      dst = dstData.data;
+      
+      for (let y = 0; y < canvas.height; y++) {
+        for (let x = 0; x < canvas.width; x++) {
+          const dstOff = (y * canvas.width + x) * 4;
+          let r = 0, g = 0, b = 0;
+          for (let cy = 0; cy < side; cy++) {
+            for (let cx = 0; cx < side; cx++) {
+              const scy = Math.min(canvas.height - 1, Math.max(0, y + cy - halfSide));
+              const scx = Math.min(canvas.width - 1, Math.max(0, x + cx - halfSide));
+              const srcOff = (scy * canvas.width + scx) * 4;
+              const wt = sharpenKernel[cy * side + cx];
+              r += src[srcOff] * wt;
+              g += src[srcOff + 1] * wt;
+              b += src[srcOff + 2] * wt;
+            }
+          }
+          dst[dstOff] = Math.max(0, Math.min(255, r));
+          dst[dstOff + 1] = Math.max(0, Math.min(255, g));
+          dst[dstOff + 2] = Math.max(0, Math.min(255, b));
+          dst[dstOff + 3] = src[dstOff + 3];
+        }
+      }
+      ctx.putImageData(dstData, 0, 0);
+
+      // --- FINAL STAGE: Convert to file ---
       canvas.toBlob(
         (blob) => {
           if (blob) {
