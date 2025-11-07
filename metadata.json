@@ -1,0 +1,8 @@
+{
+  "name": "Copy of GST Bill Validator",
+  "description": "An app to scan retail bills, validate tax calculations and GST codes against Indian tax rules, highlight incorrect charges, and suggest corrective actions. Tagline: 'make every bill honest'",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ]
+}
